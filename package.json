@@ -1,21 +1,21 @@
-
 {
-  "name": "gdrive-uploader",
+  "name": "advanced-file-server",
   "version": "1.0.0",
-  "description": "Secure server to upload and list files on Google Drive",
+  "description": "Advanced file storage server with auto-ping and CRUD operations",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "keep-alive": "node keep-alive.js"
   },
-  "author": "Aiva",
-  "license": "ISC",
   "dependencies": {
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "express-basic-auth": "^1.2.0",
-    "googleapis": "^132.0.0",
-    "multer": "^1.4.5-lts.1",
-    "open": "^9.2.0"
+    "express": "^4.18.3",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
