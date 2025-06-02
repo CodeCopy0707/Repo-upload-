@@ -1191,13 +1191,18 @@ function renderError(message) {
  * @param {string} text - The string to escape.
  * @returns {string} The escaped string.
  */
+/**
+ * Escapes HTML entities in a string to prevent XSS.
+ * @param {string} text - The string to escape.
+ * @returns {string} The escaped string.
+ */
 function escapeHtml(text) {
   const map = {
     '&': '&',
     '<': '<',
     '>': '>',
     '"': '"',
-    "'": ''' // <-- यह लाइन ठीक की गई है
+    "'": ''' // यह बिल्कुल ऐसे ही होना चाहिए, बिना किसी अतिरिक्त ''' या कमेंट के।
   };
   return text.replace(/[&<>"']/g, function(m) { return map[m]; });
 }
