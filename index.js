@@ -5,11 +5,15 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Create upload directory if not exists
+const uploadDir = 'uploads';
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
 // Configure storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = 'uploads/';
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
@@ -20,12 +24,17 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 let fileHistory = [];
 
-// Self-ping mechanism
-setInterval(() => {
-  fetch(`http://localhost:${PORT}/ping`)
-    .then(res => console.log('Server pinged successfully'))
+// Self-ping mechanism using environment host
+const selfPing = () => {
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+  const protocol = process.env.NODE_ENV === 'production' ? 'https' : 'http';
+  
+  fetch(`${protocol}://${host}/ping`)
+    .then(res => console.log(`Server pinged successfully at ${new Date().toISOString()}`))
     .catch(err => console.error('Ping failed:', err));
-}, 30000);
+};
+
+setInterval(selfPing, 30000);
 
 // Middleware
 app.use(express.urlencoded({ extended: true }));
@@ -35,18 +44,28 @@ app.use(express.static('public'));
 app.get('/ping', (req, res) => res.send('pong'));
 
 app.get('/', (req, res) => {
-  fs.readdir('uploads', (err, files) => {
+  fs.readdir(uploadDir, (err, files) => {
+    if (err) {
+      console.error('Error reading directory:', err);
+      return res.send(renderHTML([]));
+    }
+
     const fileList = files.map(file => {
-      const filePath = path.join('uploads', file);
-      const stats = fs.statSync(filePath);
-      return {
-        name: file,
-        size: formatBytes(stats.size),
-        uploaded: stats.birthtime.toLocaleString(),
-        type: path.extname(file).slice(1) || 'file',
-        downloadUrl: `/download/${file}`
-      };
-    });
+      const filePath = path.join(uploadDir, file);
+      try {
+        const stats = fs.statSync(filePath);
+        return {
+          name: file,
+          size: formatBytes(stats.size),
+          uploaded: stats.birthtime.toLocaleString(),
+          type: path.extname(file).slice(1) || 'file',
+          downloadUrl: `/download/${file}`
+        };
+      } catch (e) {
+        console.error(`Error processing file ${file}:`, e);
+        return null;
+      }
+    }).filter(file => file !== null);
     
     res.send(renderHTML(fileList));
   });
@@ -64,18 +83,22 @@ app.post('/upload', upload.single('file'), (req, res) => {
 });
 
 app.get('/view/:filename', (req, res) => {
-  const filePath = path.join('uploads', req.params.filename);
+  const filePath = path.join(uploadDir, req.params.filename);
   
   if (fs.existsSync(filePath)) {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    res.send(renderFileView(req.params.filename, content));
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      res.send(renderFileView(req.params.filename, content));
+    } catch (e) {
+      res.status(500).send(renderError('Error reading file'));
+    }
   } else {
     res.status(404).send(renderError('File not found'));
   }
 });
 
 app.get('/download/:filename', (req, res) => {
-  const filePath = path.join('uploads', req.params.filename);
+  const filePath = path.join(uploadDir, req.params.filename);
   
   if (fs.existsSync(filePath)) {
     res.download(filePath);
@@ -85,31 +108,39 @@ app.get('/download/:filename', (req, res) => {
 });
 
 app.post('/save/:filename', (req, res) => {
-  const filePath = path.join('uploads', req.params.filename);
+  const filePath = path.join(uploadDir, req.params.filename);
   
   if (fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, req.body.content);
-    fileHistory.push({
-      action: 'edit',
-      filename: req.params.filename,
-      timestamp: new Date().toISOString()
-    });
-    res.redirect('/');
+    try {
+      fs.writeFileSync(filePath, req.body.content);
+      fileHistory.push({
+        action: 'edit',
+        filename: req.params.filename,
+        timestamp: new Date().toISOString()
+      });
+      res.redirect('/');
+    } catch (e) {
+      res.status(500).send(renderError('Error saving file'));
+    }
   } else {
     res.status(404).send(renderError('File not found'));
   }
 });
 
 app.get('/delete/:filename', (req, res) => {
-  const filePath = path.join('uploads', req.params.filename);
+  const filePath = path.join(uploadDir, req.params.filename);
   
   if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-    fileHistory.push({
-      action: 'delete',
-      filename: req.params.filename,
-      timestamp: new Date().toISOString()
-    });
+    try {
+      fs.unlinkSync(filePath);
+      fileHistory.push({
+        action: 'delete',
+        filename: req.params.filename,
+        timestamp: new Date().toISOString()
+      });
+    } catch (e) {
+      console.error('Error deleting file:', e);
+    }
   }
   res.redirect('/');
 });
@@ -139,7 +170,6 @@ function renderHTML(files) {
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script>
-      // Drag and drop functionality
       document.addEventListener('DOMContentLoaded', () => {
         const dropArea = document.querySelector('.drop-area');
         
@@ -322,7 +352,7 @@ function renderFileView(filename, content) {
         <div class="bg-gray-50 px-4 py-2 border-b flex justify-between items-center">
           <div>
             <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-              ${path.extname(filename).toUpperCase().slice(1)} FILE
+              ${path.extname(filename).toUpperCase().slice(1) || 'TEXT'} FILE
             </span>
           </div>
           <a href="/download/${filename}" class="text-blue-500 hover:text-blue-700">
@@ -469,6 +499,8 @@ app.listen(PORT, () => {
   console.log(`
   🚀 Server running at: http://localhost:${PORT}
   ⏰ Auto-ping enabled (every 30 seconds)
-  📁 File storage: ${path.join(__dirname, 'uploads')}
+  📁 File storage: ${path.join(__dirname, uploadDir)}
   `);
+  // Initial ping
+  selfPing();
 });
