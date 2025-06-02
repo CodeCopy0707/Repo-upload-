@@ -9,62 +9,58 @@ const PORT = process.env.PORT || 3000;
 // ======================
 // Configuration
 // ======================
-const uploadDir = 'uploads'; // Directory to store uploaded files
-const maxFileSize = 200 * 1024 * 1024; // 200MB (Increased for more flexibility)
-const maxFiles = 20; // Maximum files per upload request (Increased)
-const historyLimit = 1000; // Max entries in activity history
+const uploadDir = 'uploads';
+const maxFileSize = 200 * 1024 * 1024; // Increased to 200MB
+const maxFiles = 20; // Increased to 20 files per upload
+const allowedFileTypes = /jpeg|jpg|png|gif|pdf|doc|docx|xls|xlsx|txt|csv|json|md|js|html|css|zip|tar|gz|rar|mp3|mp4|mov|avi|webm/; // More comprehensive list
+const retentionDays = 30; // Files older than this will be marked for potential cleanup
 
-// Ensure the upload directory exists
+// Create upload directory if not exists
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
 // ======================
-// Storage Configuration for Multer
+// Storage Configuration
 // ======================
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, uploadDir); // Store files in the 'uploads' directory
+    cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    // Generate a unique and safe filename: timestamp-randomSuffix-originalName
-    const uniqueSuffix = crypto.randomBytes(8).toString('hex');
-    // Sanitize original filename to prevent directory traversal or invalid characters
+    // Generate a unique ID for the file to store in metadata
+    const fileId = crypto.randomBytes(16).toString('hex');
+    const uniqueSuffix = Date.now();
+    // Sanitize the original filename to prevent path traversal and other issues
     const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    cb(null, `${Date.now()}-${uniqueSuffix}-${sanitizedName}`);
+    // Store metadata in the filename itself for simplicity, or in a separate database
+    cb(null, `${uniqueSuffix}-${fileId}-${sanitizedName}`);
   }
 });
 
-// Multer upload middleware configuration
 const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: maxFileSize, // Limit file size
-    files: maxFiles // Limit number of files in a single upload
-  },
+  storage,
+  limits: { fileSize: maxFileSize, files: maxFiles },
   fileFilter: (req, file, cb) => {
-    // Optional: Implement stricter file type filtering if needed
-    // Example: Only allow images and PDFs
-    // if (!file.mimetype.startsWith('image/') && file.mimetype !== 'application/pdf') {
-    //   return cb(new Error('Only images and PDFs are allowed!'), false);
-    // }
-    cb(null, true);
+    const extname = allowedFileTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedFileTypes.test(file.mimetype);
+
+    if (extname && mimetype) {
+      return cb(null, true);
+    } else {
+      cb(new Error(`File type not allowed: ${file.originalname}. Allowed types: ${allowedFileTypes.source}`));
+    }
   }
 });
 
-// Global state variables
-let fileHistory = []; // Stores activity logs
-let activeConnections = 0; // Tracks active HTTP connections for server status
+// In-memory store for file metadata and history (consider a persistent store like SQLite for production)
+let fileMetadata = {}; // { fileId: { name, size, type, uploaded, path, originalName, downloads, lastAccessed } }
+let fileHistory = []; // { action, filename, timestamp, ip, userId (if authentication is added) }
+let activeConnections = 0;
 
 // ======================
-// Helper Functions (Utility and Formatting)
+// Helper Functions
 // ======================
-
-/**
- * Formats bytes into a human-readable string (e.g., KB, MB, GB).
- * @param {number} bytes - The number of bytes.
- * @returns {string} Formatted size string.
- */
 function formatBytes(bytes) {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -73,377 +69,463 @@ function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-/**
- * Determines the general type of a file based on its extension.
- * @param {string} filename - The name of the file.
- * @returns {string} A general file type (e.g., 'image', 'pdf', 'text', 'code', 'archive', 'audio', 'video', 'other').
- */
 function getFileType(filename) {
   const ext = path.extname(filename).toLowerCase().slice(1);
   const typeMap = {
-    // Images
-    jpg: 'image', jpeg: 'image', png: 'image', gif: 'image', bmp: 'image', webp: 'image', tiff: 'image',
-    // Documents
+    jpg: 'image', jpeg: 'image', png: 'image', gif: 'image', webp: 'image',
     pdf: 'pdf',
-    doc: 'document', docx: 'document',
-    xls: 'spreadsheet', xlsx: 'spreadsheet', csv: 'spreadsheet',
-    ppt: 'presentation', pptx: 'presentation',
-    // Text and Code
-    txt: 'text', md: 'text', rtf: 'text',
-    js: 'code', html: 'code', css: 'code', json: 'code', xml: 'code', py: 'code', java: 'code', c: 'code', cpp: 'code', sh: 'code',
-    // Archives
-    zip: 'archive', rar: 'archive', '7z': 'archive', tar: 'archive', gz: 'archive',
-    // Audio
-    mp3: 'audio', wav: 'audio', ogg: 'audio', flac: 'audio', aac: 'audio',
-    // Video
-    mp4: 'video', mkv: 'video', avi: 'video', mov: 'video', wmv: 'video', flv: 'video',
-    // Other
-    exe: 'executable', dmg: 'executable', iso: 'disk_image',
+    doc: 'document', docx: 'document', xls: 'spreadsheet', xlsx: 'spreadsheet', ppt: 'presentation', pptx: 'presentation',
+    txt: 'text', csv: 'text', json: 'text', md: 'text', xml: 'text', log: 'text',
+    js: 'code', html: 'code', css: 'code', php: 'code', py: 'code', c: 'code', cpp: 'code', java: 'code', sh: 'code',
+    zip: 'archive', tar: 'archive', gz: 'archive', rar: 'archive',
+    mp3: 'audio', wav: 'audio', ogg: 'audio',
+    mp4: 'video', mov: 'video', avi: 'video', webm: 'video', mkv: 'video'
   };
-  return typeMap[ext] || 'other'; // Default to 'other' if not found
+  return typeMap[ext] || 'other';
 }
 
-/**
- * Returns a Font Awesome icon class based on the file type.
- * @param {string} fileType - The general file type (from getFileType).
- * @returns {string} Font Awesome icon class.
- */
 function getFileIcon(fileType) {
   const iconMap = {
-    image: 'fa-file-image',
-    pdf: 'fa-file-pdf',
-    document: 'fa-file-word',
-    spreadsheet: 'fa-file-excel',
-    presentation: 'fa-file-powerpoint',
-    text: 'fa-file-alt',
-    code: 'fa-file-code',
-    archive: 'fa-file-archive',
-    audio: 'fa-file-audio',
-    video: 'fa-file-video',
-    executable: 'fa-file-invoice', // Or fa-cogs
-    disk_image: 'fa-compact-disc',
-    other: 'fa-file'
+    image: 'fas fa-file-image',
+    pdf: 'fas fa-file-pdf',
+    document: 'fas fa-file-word',
+    spreadsheet: 'fas fa-file-excel',
+    presentation: 'fas fa-file-powerpoint',
+    text: 'fas fa-file-alt',
+    code: 'fas fa-file-code',
+    archive: 'fas fa-file-archive',
+    audio: 'fas fa-file-audio',
+    video: 'fas fa-file-video',
+    other: 'fas fa-file'
   };
-  return iconMap[fileType] || 'fa-file';
+  return iconMap[fileType] || 'fas fa-file';
 }
 
-/**
- * Logs an activity to the in-memory history.
- * @param {string} action - The action performed (e.g., 'upload', 'download', 'edit', 'delete').
- * @param {string} filename - The original name of the file involved.
- * @param {object} req - The Express request object to get IP address.
- */
-function logActivity(action, filename, req) {
-  fileHistory.unshift({ // Add to the beginning
-    action: action,
-    filename: filename,
+function logActivity(action, filename, req, fileId = 'N/A') {
+  fileHistory.unshift({
+    action,
+    filename,
+    fileId,
     timestamp: new Date().toISOString(),
-    ip: req.ip || 'unknown' // Log client IP address
+    ip: req.ip || 'unknown',
+    userAgent: req.headers['user-agent'] || 'unknown',
+    // userId: req.user ? req.user.id : 'guest' // Uncomment if authentication is implemented
   });
 
-  // Trim history to limit
-  if (fileHistory.length > historyLimit) {
-    fileHistory.pop(); // Remove the oldest entry
+  // Keep history to last 1000 entries (or more, depending on needs)
+  if (fileHistory.length > 1000) {
+    fileHistory.pop();
   }
 }
+
+// Function to update file metadata (e.g., download count, last accessed)
+function updateFileMetadata(fileId, updates) {
+  if (fileMetadata[fileId]) {
+    fileMetadata[fileId] = { ...fileMetadata[fileId], ...updates };
+  }
+}
+
+// Function to get metadata from filename
+function parseFilename(filename) {
+  const parts = filename.split('-');
+  if (parts.length < 3) return null; // Not a file managed by this system format
+
+  const uploadedTimestamp = parseInt(parts[0]);
+  const fileId = parts[1];
+  const originalName = parts.slice(2).join('-');
+
+  if (isNaN(uploadedTimestamp) || !fileId || !originalName) return null;
+
+  return { uploadedTimestamp, fileId, originalName };
+}
+
+// Schedule a cleanup task (e.g., daily) - DANGER: Implement carefully in production
+// This is a basic example, a more robust solution would involve user confirmation or strict policies
+// setInterval(() => {
+//     console.log('Running scheduled cleanup...');
+//     const cutoffDate = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
+//     fs.readdir(uploadDir, (err, files) => {
+//         if (err) {
+//             console.error('Cleanup directory read error:', err);
+//             return;
+//         }
+//         files.forEach(file => {
+//             const filePath = path.join(uploadDir, file);
+//             try {
+//                 const stats = fs.statSync(filePath);
+//                 const { uploadedTimestamp } = parseFilename(file);
+//                 if (uploadedTimestamp && uploadedTimestamp < cutoffDate) {
+//                     console.log(`Deleting old file: ${file}`);
+//                     fs.unlinkSync(filePath);
+//                     delete fileMetadata[parseFilename(file).fileId]; // Remove from metadata
+//                     logActivity('cleanup', parseFilename(file).originalName, { ip: 'system' });
+//                 }
+//             } catch (e) {
+//                 console.error(`Cleanup file processing error for ${file}:`, e);
+//             }
+//         });
+//     });
+// }, 24 * 60 * 60 * 1000); // Run once every 24 hours (86400000 ms)
 
 // ======================
 // Middleware
 // ======================
-app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies (for form submissions)
-app.use(express.json()); // Parse JSON bodies
-app.use(express.static('public')); // Serve static files from the 'public' directory
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+// Serve static files from the 'public' directory
+app.use(express.static('public'));
 
-// Security Headers
+// Security middleware - more robust headers
 app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff'); // Prevent MIME-sniffing
-  res.setHeader('X-Frame-Options', 'DENY'); // Prevent clickjacking
-  res.setHeader('X-XSS-Protection', '1; mode=block'); // Enable XSS protection
-  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload'); // HSTS
-  res.setHeader('Referrer-Policy', 'no-referrer-when-downgrade'); // Referrer policy
-  activeConnections++; // Increment active connections counter
-  res.on('finish', () => { // Decrement when response is sent
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self' https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; style-src 'self' https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; font-src 'self' https://cdnjs.cloudflare.com;"); // Example CSP, adjust as needed
+  activeConnections++;
+  res.on('finish', () => {
     activeConnections--;
   });
   next();
 });
 
-// Basic logging middleware
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} from ${req.ip}`);
-  next();
-});
+// Basic authentication middleware (example - use proper auth in production)
+// This is a very simple example and should NOT be used for real authentication.
+// For production, integrate with OAuth, JWT, session management, etc.
+const authenticate = (req, res, next) => {
+  // if (req.headers.authorization === 'Bearer YOUR_SECRET_TOKEN') {
+  //   req.user = { id: 'admin', username: 'admin' }; // Dummy user
+  //   next();
+  // } else {
+  //   res.status(401).send(renderError('Unauthorized: Please provide a valid token.'));
+  // }
+  next(); // For now, allowing all access
+};
+app.use(authenticate); // Apply authentication to all routes (adjust as needed)
 
 // ======================
 // Routes
 // ======================
-
-// Health check endpoint
 app.get('/ping', (req, res) => res.send('pong'));
 
-// Root route - Dashboard view
 app.get('/', (req, res) => {
   fs.readdir(uploadDir, (err, files) => {
     if (err) {
       console.error('Directory read error:', err);
-      // Render an error page in case of server issues reading directory
-      return res.status(500).send(renderError('Server error: Could not read file directory.'));
+      return res.status(500).send(renderError('Server error: Could not list files.'));
     }
 
     const fileList = files.map(file => {
       try {
         const filePath = path.join(uploadDir, file);
-        const stats = fs.statSync(filePath); // Get file statistics
-        const parts = file.split('-'); // Split the unique filename (timestamp-suffix-original)
-        const uploadedTimestamp = parseInt(parts[0]);
-        // Reconstruct original name from parts, handling potential hyphens in original name
-        const originalName = parts.slice(2).join('-');
-        const fileType = getFileType(file);
+        const stats = fs.statSync(filePath);
+        const parsed = parseFilename(file);
+
+        if (!parsed) {
+          console.warn(`Skipping malformed filename: ${file}`);
+          return null;
+        }
+
+        const { uploadedTimestamp, fileId, originalName } = parsed;
+
+        // Populate fileMetadata if not already present
+        if (!fileMetadata[fileId]) {
+          fileMetadata[fileId] = {
+            id: fileId,
+            name: originalName,
+            size: stats.size,
+            uploaded: new Date(uploadedTimestamp).toISOString(),
+            type: getFileType(file),
+            path: filePath,
+            originalName: originalName,
+            downloads: 0,
+            lastAccessed: null,
+            lastModified: new Date(stats.mtime).toISOString()
+          };
+        } else {
+          // Update stats if already exists (e.g., after an edit)
+          fileMetadata[fileId].size = stats.size;
+          fileMetadata[fileId].lastModified = new Date(stats.mtime).toISOString();
+        }
+
+        const fileEntry = fileMetadata[fileId];
 
         return {
-          id: file, // Full unique filename
+          id: file, // Full filename for operations
+          fileId: fileId, // Unique ID for metadata lookup
           name: originalName,
-          size: formatBytes(stats.size),
-          uploaded: new Date(uploadedTimestamp).toLocaleString(), // Format upload timestamp
-          type: fileType,
-          icon: getFileIcon(fileType),
+          size: formatBytes(fileEntry.size),
+          uploaded: new Date(fileEntry.uploaded).toLocaleString(),
+          lastModified: new Date(fileEntry.lastModified).toLocaleString(),
+          type: fileEntry.type,
+          icon: getFileIcon(fileEntry.type),
           downloadUrl: `/download/${file}`,
           previewUrl: `/preview/${file}`,
-          editUrl: (fileType === 'text' || fileType === 'code') ? `/edit/${file}` : null // Only editable for text/code
+          editUrl: fileEntry.type === 'text' || fileEntry.type === 'code' ? `/edit/${file}` : null,
+          downloads: fileEntry.downloads,
+          lastAccessed: fileEntry.lastAccessed ? new Date(fileEntry.lastAccessed).toLocaleString() : 'Never'
         };
       } catch (e) {
-        console.error(`Error processing file ${file}:`, e);
-        // If a file is corrupted or unreadable, exclude it from the list
+        console.error(`File processing error for ${file}:`, e);
         return null;
       }
-    }).filter(file => file !== null); // Filter out any null entries from errors
+    }).filter(file => file !== null).sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded)); // Sort by most recent upload
 
-    res.send(renderDashboard(fileList, activeConnections)); // Pass active connections to dashboard
+    res.send(renderDashboard(fileList));
   });
 });
 
-// File Upload Route
 app.post('/upload', upload.array('files', maxFiles), (req, res) => {
   if (!req.files || req.files.length === 0) {
-    // Handle no files uploaded case
-    return res.status(400).send(renderError('No files were uploaded. Please select one or more files.'));
+    return res.status(400).send(renderError('No files uploaded. Please select one or more files.'));
   }
 
   req.files.forEach(file => {
-    // Log each successful upload
-    logActivity('upload', file.originalname, req);
+    const parsed = parseFilename(file.filename);
+    if (parsed) {
+      const { fileId, originalName, uploadedTimestamp } = parsed;
+      fileMetadata[fileId] = {
+        id: fileId,
+        name: originalName,
+        size: file.size,
+        uploaded: new Date(uploadedTimestamp).toISOString(),
+        type: getFileType(file.filename),
+        path: file.path,
+        originalName: originalName,
+        downloads: 0,
+        lastAccessed: null,
+        lastModified: new Date().toISOString()
+      };
+      logActivity('upload', originalName, req, fileId);
+    }
   });
 
-  res.redirect('/'); // Redirect back to the dashboard after upload
+  res.redirect('/');
 });
 
-// File Preview Route
 app.get('/preview/:filename', (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(uploadDir, filename);
+  const filePath = path.join(uploadDir, req.params.filename);
+  const parsed = parseFilename(req.params.filename);
 
-  // Validate filename to prevent path traversal
-  if (!fs.existsSync(filePath) || !filePath.startsWith(path.resolve(uploadDir))) {
+  if (!parsed || !fs.existsSync(filePath)) {
     return res.status(404).send(renderError('File not found or invalid filename.'));
   }
 
-  try {
-    const fileType = getFileType(filename);
-    const parts = filename.split('-');
-    const originalName = parts.slice(2).join('-');
-    const stats = fs.statSync(filePath);
+  const { fileId, originalName } = parsed;
+  updateFileMetadata(fileId, { lastAccessed: new Date().toISOString() });
+  logActivity('preview', originalName, req, fileId);
 
-    // Conditional rendering based on file type for optimal preview
+  try {
+    const fileType = getFileType(req.params.filename);
+
     if (fileType === 'image') {
-      return res.send(renderImagePreview(filename, originalName));
+      return res.send(renderImagePreview(req.params.filename, originalName));
     } else if (fileType === 'pdf') {
-      return res.send(renderPDFPreview(filename, originalName));
+      return res.send(renderPDFPreview(req.params.filename, originalName));
     } else if (fileType === 'text' || fileType === 'code') {
       const content = fs.readFileSync(filePath, 'utf-8');
-      return res.send(renderTextViewer(filename, originalName, content));
-    } else if (fileType === 'audio' || fileType === 'video') {
-      // For media, use HTML5 audio/video tags which link directly to download URL
-      return res.send(renderMediaPlayer(filename, originalName, fileType));
+      return res.send(renderTextViewer(req.params.filename, originalName, content));
+    } else if (fileType === 'audio') {
+      return res.send(renderAudioPlayer(req.params.filename, originalName));
+    } else if (fileType === 'video') {
+      return res.send(renderVideoPlayer(req.params.filename, originalName));
     } else {
-      // For other file types, offer download and basic info
-      return res.send(renderDefaultPreview(filename, originalName, stats.size));
+      const stats = fs.statSync(filePath);
+      return res.send(renderDefaultPreview(req.params.filename, originalName, stats.size, fileType));
     }
   } catch (e) {
     console.error('Preview error:', e);
-    res.status(500).send(renderError('Error generating preview. The file might be corrupted or unreadable.'));
+    res.status(500).send(renderError(`Error generating preview for ${originalName}.`));
   }
 });
 
-// File Download Route
 app.get('/download/:filename', (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(uploadDir, filename);
-  const parts = filename.split('-');
-  const originalName = parts.slice(2).join('-');
+  const filePath = path.join(uploadDir, req.params.filename);
+  const parsed = parseFilename(req.params.filename);
 
-  // Validate filename to prevent path traversal
-  if (!fs.existsSync(filePath) || !filePath.startsWith(path.resolve(uploadDir))) {
+  if (!parsed || !fs.existsSync(filePath)) {
     return res.status(404).send(renderError('File not found or invalid filename.'));
   }
 
-  try {
-    logActivity('download', originalName, req); // Log download activity
-    // Set Content-Disposition header to ensure proper filename for download
-    res.download(filePath, originalName, (err) => {
-      if (err) {
-        console.error('Download error:', err);
-        // Handle specific download errors, e.g., file not found (though checked above), permissions
-        if (err.code === 'ENOENT') {
-          return res.status(404).send(renderError('File not found during download.'));
-        }
-        res.status(500).send(renderError('Failed to download the file.'));
+  const { fileId, originalName } = parsed;
+
+  updateFileMetadata(fileId, { downloads: (fileMetadata[fileId].downloads || 0) + 1, lastAccessed: new Date().toISOString() });
+  logActivity('download', originalName, req, fileId);
+
+  res.download(filePath, originalName, (err) => {
+    if (err) {
+      console.error(`Download error for ${originalName}:`, err);
+      // Check if headers have already been sent before sending a new response
+      if (!res.headersSent) {
+        res.status(500).send(renderError(`Could not download file ${originalName}.`));
       }
-    });
-  } catch (e) {
-    console.error('Download preparation error:', e);
-    res.status(500).send(renderError('An unexpected error occurred during download preparation.'));
-  }
+    }
+  });
 });
 
-// File Edit Route (GET for editor page)
 app.get('/edit/:filename', (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(uploadDir, filename);
+  const filePath = path.join(uploadDir, req.params.filename);
+  const parsed = parseFilename(req.params.filename);
 
-  // Validate filename and ensure it's a text/code file before attempting to edit
-  const fileType = getFileType(filename);
-  if (fileType !== 'text' && fileType !== 'code') {
-    return res.status(400).send(renderError('Only text and code files can be edited directly.'));
+  if (!parsed || !fs.existsSync(filePath)) {
+    return res.status(404).send(renderError('File not found or invalid filename.'));
   }
 
-  if (!fs.existsSync(filePath) || !filePath.startsWith(path.resolve(uploadDir))) {
-    return res.status(404).send(renderError('File not found or invalid filename.'));
+  const { fileId, originalName } = parsed;
+  const fileType = getFileType(req.params.filename);
+
+  if (fileType !== 'text' && fileType !== 'code') {
+    return res.status(400).send(renderError(`Editing is only supported for text and code files. This is a ${fileType} file.`));
   }
 
   try {
     const content = fs.readFileSync(filePath, 'utf-8');
-    res.send(renderFileEditor(filename, content));
+    updateFileMetadata(fileId, { lastAccessed: new Date().toISOString() });
+    res.send(renderFileEditor(req.params.filename, originalName, content));
   } catch (e) {
-    console.error('Error reading file for editing:', e);
-    res.status(500).send(renderError('Error reading file for editing. It might be too large or corrupted.'));
+    console.error('Error reading file for edit:', e);
+    res.status(500).send(renderError(`Error reading file ${originalName} for editing.`));
   }
 });
 
-// File Save Route (POST for saving edited content)
 app.post('/save/:filename', (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(uploadDir, filename);
-  const newContent = req.body.content;
+  const filePath = path.join(uploadDir, req.params.filename);
+  const parsed = parseFilename(req.params.filename);
 
-  // Validate filename
-  if (!fs.existsSync(filePath) || !filePath.startsWith(path.resolve(uploadDir))) {
-    return res.status(404).send(renderError('File not found or invalid filename for saving.'));
+  if (!parsed || !fs.existsSync(filePath)) {
+    return res.status(404).send(renderError('File not found or invalid filename.'));
   }
 
-  // Basic validation of content
-  if (typeof newContent !== 'string') {
-    return res.status(400).send(renderError('Invalid content provided for saving.'));
+  const { fileId, originalName } = parsed;
+  const fileType = getFileType(req.params.filename);
+
+  if (fileType !== 'text' && fileType !== 'code') {
+    return res.status(400).send(renderError(`Saving is only supported for text and code files. This is a ${fileType} file.`));
   }
 
   try {
-    fs.writeFileSync(filePath, newContent, 'utf-8');
-    const parts = filename.split('-');
-    const originalName = parts.slice(2).join('-');
-    logActivity('edit', originalName, req); // Log edit activity
-    res.redirect('/'); // Redirect back to dashboard
+    fs.writeFileSync(filePath, req.body.content);
+    const stats = fs.statSync(filePath); // Get updated file size and modification time
+    updateFileMetadata(fileId, { size: stats.size, lastModified: new Date().toISOString(), lastAccessed: new Date().toISOString() });
+    logActivity('edit', originalName, req, fileId);
+    res.redirect('/');
   } catch (e) {
     console.error('Error saving file:', e);
-    res.status(500).send(renderError('Error saving file. Check file permissions or disk space.'));
+    res.status(500).send(renderError(`Error saving changes to ${originalName}.`));
   }
 });
 
-// File Delete Route (Single file)
 app.post('/delete/:filename', (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(uploadDir, filename);
+  const filePath = path.join(uploadDir, req.params.filename);
+  const parsed = parseFilename(req.params.filename);
 
-  // Validate filename
-  if (!fs.existsSync(filePath) || !filePath.startsWith(path.resolve(uploadDir))) {
-    return res.status(404).send(renderError('File not found or invalid filename for deletion.'));
+  if (!parsed || !fs.existsSync(filePath)) {
+    return res.status(404).send(renderError('File not found or invalid filename.'));
   }
+
+  const { fileId, originalName } = parsed;
 
   try {
-    fs.unlinkSync(filePath); // Delete the file
-    const parts = filename.split('-');
-    const originalName = parts.slice(2).join('-');
-    logActivity('delete', originalName, req); // Log delete activity
-    res.redirect('/'); // Redirect back to dashboard
+    fs.unlinkSync(filePath);
+    delete fileMetadata[fileId]; // Remove from in-memory metadata
+    logActivity('delete', originalName, req, fileId);
+    res.redirect('/');
   } catch (e) {
     console.error('Error deleting file:', e);
-    res.status(500).send(renderError('Error deleting file. Check file permissions.'));
+    res.status(500).send(renderError(`Error deleting file ${originalName}.`));
   }
 });
 
-// Multiple File Delete Route (Bulk deletion)
 app.post('/delete-multiple', (req, res) => {
-  // Ensure req.body.files is an array
   const filesToDelete = Array.isArray(req.body.files) ? req.body.files : [];
-
-  if (filesToDelete.length === 0) {
-    return res.status(400).send(renderError('No files selected for multiple deletion.'));
-  }
-
   let deletedCount = 0;
-  let errorMessages = [];
+  let errorCount = 0;
 
   filesToDelete.forEach(filename => {
     const filePath = path.join(uploadDir, filename);
-    // Crucial security check: Ensure the file path is within the designated upload directory
-    if (fs.existsSync(filePath) && filePath.startsWith(path.resolve(uploadDir))) {
+    const parsed = parseFilename(filename);
+
+    if (parsed && fs.existsSync(filePath)) {
+      const { fileId, originalName } = parsed;
       try {
         fs.unlinkSync(filePath);
-        const parts = filename.split('-');
-        const originalName = parts.slice(2).join('-');
-        logActivity('delete', originalName, req);
+        delete fileMetadata[fileId];
+        logActivity('delete', originalName, req, fileId);
         deletedCount++;
       } catch (e) {
         console.error(`Error deleting file ${filename}:`, e);
-        errorMessages.push(`Failed to delete ${filename}: ${e.message}`);
+        errorCount++;
       }
     } else {
-      errorMessages.push(`Skipped invalid or non-existent file: ${filename}`);
+      console.warn(`Attempted to delete non-existent or malformed file: ${filename}`);
+      errorCount++;
     }
   });
 
-  if (errorMessages.length > 0) {
-    // Optionally redirect with a message or render an error page
-    console.warn(`Bulk delete completed with errors: ${errorMessages.join(', ')}`);
-    // For simplicity, we just redirect. A more robust solution might show a flash message.
+  if (errorCount > 0) {
+    res.status(500).send(renderError(`Successfully deleted ${deletedCount} files, but encountered errors with ${errorCount} files.`));
+  } else {
+    res.redirect('/');
   }
-  res.redirect('/');
 });
 
-// Activity History Route
+// Route for file sharing (generates a temporary, shareable link)
+// This is a basic example; for production, implement token-based access, expiry, etc.
+app.get('/share/:filename', (req, res) => {
+  const filePath = path.join(uploadDir, req.params.filename);
+  const parsed = parseFilename(req.params.filename);
+
+  if (!parsed || !fs.existsSync(filePath)) {
+    return res.status(404).send(renderError('File not found for sharing.'));
+  }
+
+  const { fileId, originalName } = parsed;
+  // In a real application, you'd generate a unique, short-lived token here
+  // For simplicity, we'll just redirect to download, implying public access
+  // For true sharing, you'd likely have a dedicated route like /s/:token
+  logActivity('share', originalName, req, fileId);
+  res.send(renderShareLink(req.params.filename, originalName));
+});
+
+// Admin Panel (requires robust authentication in production)
+app.get('/admin', authenticate, (req, res) => {
+  // Example data for admin panel
+  const systemInfo = {
+    totalFiles: Object.keys(fileMetadata).length,
+    totalStorageUsed: formatBytes(Object.values(fileMetadata).reduce((sum, f) => sum + f.size, 0)),
+    activeConnections: activeConnections,
+    maxFileSize: formatBytes(maxFileSize),
+    maxFilesPerUpload: maxFiles,
+    retentionPolicy: `${retentionDays} days`
+  };
+  res.send(renderAdminPanel(systemInfo, fileMetadata, fileHistory));
+});
+
+// Route to get file metadata (for API use or advanced UI)
+app.get('/api/file-metadata/:filename', (req, res) => {
+  const parsed = parseFilename(req.params.filename);
+  if (!parsed) {
+    return res.status(400).json({ error: 'Invalid filename format' });
+  }
+  const fileId = parsed.fileId;
+  const metadata = fileMetadata[fileId];
+  if (metadata) {
+    res.json(metadata);
+  } else {
+    res.status(404).json({ error: 'File metadata not found' });
+  }
+});
+
 app.get('/history', (req, res) => {
   res.send(renderHistory(fileHistory));
 });
 
-// Error handling middleware (catch-all for unhandled errors)
-app.use((err, req, res, next) => {
-  console.error('Unhandled server error:', err.stack);
-  res.status(500).send(renderError('An unexpected server error occurred. Please try again later.'));
-});
-
-// Handle 404 Not Found
-app.use((req, res) => {
-  res.status(404).send(renderError(`The page you are looking for (${req.url}) does not exist.`));
-});
-
 // ======================
 // Rendering Functions (HTML Templates)
-// Using inline CSS (TailwindCSS CDN) and JS for simplicity.
-// For a larger app, consider a templating engine (EJS, Pug) and separate static assets.
+// Tailwind CSS is used for styling. Font Awesome for icons.
 // ======================
 
-function renderDashboard(files, connections) {
-  // Determine if there are any text/code files for the 'edit' filter
-  const hasEditableFiles = files.some(file => file.editUrl !== null);
-
+function renderDashboard(files) {
   return `
   <!DOCTYPE html>
   <html lang="en">
@@ -452,312 +534,244 @@ function renderDashboard(files, connections) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Advanced File Server</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-      /* Custom scrollbar for better UX */
-      ::-webkit-scrollbar {
+      /* Custom scrollbar for text viewer */
+      pre::-webkit-scrollbar {
         width: 8px;
         height: 8px;
       }
-      ::-webkit-scrollbar-track {
-        background: #f1f1f1;
-        border-radius: 10px;
+      pre::-webkit-scrollbar-thumb {
+        background-color: #cbd5e0; /* gray-400 */
+        border-radius: 4px;
       }
-      ::-webkit-scrollbar-thumb {
-        background: #888;
-        border-radius: 10px;
-      }
-      ::-webkit-scrollbar-thumb:hover {
-        background: #555;
+      pre::-webkit-scrollbar-track {
+        background-color: #f7fafc; /* gray-50 */
       }
     </style>
     <script>
       document.addEventListener('DOMContentLoaded', () => {
         // Bulk delete functionality
-        const deleteSelectedButton = document.getElementById('delete-selected');
-        if (deleteSelectedButton) {
-          deleteSelectedButton.addEventListener('click', () => {
-            const selectedFiles = Array.from(document.querySelectorAll('.file-checkbox:checked'))
-              .map(checkbox => checkbox.value);
-            
-            if (selectedFiles.length === 0) {
-              alert('Please select files to delete.');
-              return;
-            }
-            
-            if (confirm(\`Are you sure you want to delete \${selectedFiles.length} selected files?\`)) {
-              fetch('/delete-multiple', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ files: selectedFiles })
-              }).then(response => {
-                if (response.ok) {
-                  window.location.reload(); // Reload on success
-                } else {
-                  alert('Failed to delete selected files. Please check server logs.');
-                }
-              }).catch(error => {
-                console.error('Error during bulk delete:', error);
-                alert('Network error or server unreachable during bulk delete.');
-              });
-            }
-          });
-        }
-        
+        document.getElementById('delete-selected').addEventListener('click', () => {
+          const selectedFiles = Array.from(document.querySelectorAll('.file-checkbox:checked'))
+            .map(checkbox => checkbox.value);
+
+          if (selectedFiles.length === 0) {
+            alert('Please select files to delete');
+            return;
+          }
+
+          if (confirm('Are you sure you want to delete ' + selectedFiles.length + ' selected files? This action cannot be undone.')) {
+            fetch('/delete-multiple', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ files: selectedFiles })
+            }).then(response => {
+              if (response.ok) {
+                window.location.reload();
+              } else {
+                response.text().then(text => alert('Failed to delete files: ' + text));
+              }
+            }).catch(error => alert('Network error: ' + error.message));
+          }
+        });
+
         // Select all checkbox
-        const selectAllCheckbox = document.getElementById('select-all');
-        if (selectAllCheckbox) {
-          selectAllCheckbox.addEventListener('change', (e) => {
-            document.querySelectorAll('.file-checkbox').forEach(checkbox => {
-              checkbox.checked = e.target.checked;
-            });
+        document.getElementById('select-all').addEventListener('change', (e) => {
+          document.querySelectorAll('.file-checkbox').forEach(checkbox => {
+            checkbox.checked = e.target.checked;
           });
-        }
-        
+        });
+
         // Search functionality
-        const searchInput = document.getElementById('search-input');
-        if (searchInput) {
-          searchInput.addEventListener('input', (e) => {
-            const searchTerm = e.target.value.toLowerCase();
-            document.querySelectorAll('#file-list tr').forEach(row => {
-              const fileNameElement = row.querySelector('.file-name');
-              if (fileNameElement) {
-                const fileName = fileNameElement.textContent.toLowerCase();
-                row.style.display = fileName.includes(searchTerm) ? '' : 'none';
-              }
-            });
+        document.getElementById('search-input').addEventListener('input', (e) => {
+          const searchTerm = e.target.value.toLowerCase();
+          document.querySelectorAll('#file-list tr').forEach(row => {
+            const fileName = row.querySelector('.file-name').textContent.toLowerCase();
+            row.style.display = fileName.includes(searchTerm) ? '' : 'none';
           });
-        }
+        });
 
-        // Filter functionality
-        const filterSelect = document.getElementById('file-filter');
-        if (filterSelect) {
-          filterSelect.addEventListener('change', (e) => {
-            const filterType = e.target.value;
-            document.querySelectorAll('#file-list tr').forEach(row => {
-              const fileTypeElement = row.querySelector('.file-type-badge');
-              if (fileTypeElement) {
-                const actualFileType = fileTypeElement.dataset.filetype; // Use data attribute
-                if (filterType === 'all' || actualFileType === filterType) {
-                  row.style.display = '';
-                } else {
-                  row.style.display = 'none';
-                }
-              }
-            });
-          });
-        }
-
-        // Drag and drop for upload
+        // Drag and Drop for Upload Area
         const dropArea = document.getElementById('drop-area');
         const fileInput = document.getElementById('file-input');
 
-        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-          dropArea.addEventListener(eventName, preventDefaults, false);
-        });
-
-        function preventDefaults (e) {
+        dropArea.addEventListener('dragover', (e) => {
           e.preventDefault();
           e.stopPropagation();
-        }
-
-        ['dragenter', 'dragover'].forEach(eventName => {
-          dropArea.addEventListener(eventName, () => dropArea.classList.add('border-blue-500', 'bg-blue-50'), false);
+          dropArea.classList.add('border-blue-500', 'bg-blue-50');
         });
 
-        ['dragleave', 'drop'].forEach(eventName => {
-          dropArea.addEventListener(eventName, () => dropArea.classList.remove('border-blue-500', 'bg-blue-50'), false);
+        dropArea.addEventListener('dragleave', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropArea.classList.remove('border-blue-500', 'bg-blue-50');
         });
 
-        dropArea.addEventListener('drop', handleDrop, false);
+        dropArea.addEventListener('drop', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropArea.classList.remove('border-blue-500', 'bg-blue-50');
 
-        function handleDrop(e) {
-          const dt = e.dataTransfer;
-          const files = dt.files;
-          fileInput.files = files; // Assign dropped files to the input
-          // Optional: Display file names selected or trigger upload automatically
-          // document.querySelector('form').submit(); 
-        }
-
-        // Show selected file names
-        if (fileInput) {
-          fileInput.addEventListener('change', () => {
-            const fileNamesContainer = document.getElementById('selected-files-names');
-            fileNamesContainer.innerHTML = ''; // Clear previous names
-            if (fileInput.files.length > 0) {
-              Array.from(fileInput.files).forEach(file => {
-                const p = document.createElement('p');
-                p.textContent = file.name;
-                p.className = 'text-xs text-gray-700';
-                fileNamesContainer.appendChild(p);
-              });
-            }
-          });
-        }
+          if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            fileInput.files = e.dataTransfer.files;
+            // Optionally, submit the form automatically or indicate files are ready
+            // document.getElementById('upload-form').submit();
+            alert('Files ready for upload. Click "Upload Files" to proceed.');
+          }
+        });
       });
     </script>
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal">
+  <body class="bg-gray-100">
     <div class="container mx-auto px-4 py-8">
-      <h1 class="text-4xl font-extrabold text-center text-gray-800 mb-10">
-        <i class="fas fa-server text-blue-600 mr-3"></i> Advanced File Server
-      </h1>
-      
+      <h1 class="text-4xl font-extrabold text-center mb-8 text-gray-800">🚀 Advanced File Server</h1>
+
       <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
-        <!-- Upload & Server Status Panel -->
         <div class="md:col-span-1 bg-white rounded-xl shadow-lg p-6">
-          <h2 class="text-2xl font-bold mb-5 text-gray-700">Upload Files</h2>
-          <form action="/upload" method="POST" enctype="multipart/form-data" class="flex flex-col">
-            <div id="drop-area" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center mb-4 cursor-pointer transition-all duration-200 hover:border-blue-500 hover:bg-blue-50"
+          <h2 class="text-2xl font-semibold mb-6 text-gray-700">Upload Files</h2>
+          <form id="upload-form" action="/upload" method="POST" enctype="multipart/form-data" class="flex flex-col space-y-4">
+            <div id="drop-area" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer transition-all duration-200 hover:border-blue-500 hover:bg-blue-50"
                  onclick="document.getElementById('file-input').click()">
               <i class="fas fa-cloud-upload-alt text-5xl text-gray-400 mb-3"></i>
-              <p class="text-gray-600 font-medium">Drag & Drop files here, or <span class="text-blue-600 hover:underline">click to browse</span></p>
+              <p class="text-gray-600 font-medium">Drag & Drop files here, or Click to Browse</p>
               <p class="text-sm text-gray-500 mt-2">Max ${maxFiles} files, ${formatBytes(maxFileSize)} each</p>
-              <input type="file" id="file-input" name="files" multiple class="hidden" accept="*/*">
-              <div id="selected-files-names" class="mt-2 text-left text-sm text-gray-700"></div>
+              <input type="file" id="file-input" name="files" multiple class="hidden" accept="${allowedFileTypes.source.replace(/\|/g, ',.')}">
             </div>
-            <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition-colors duration-200 shadow-md">
-              <i class="fas fa-upload mr-2"></i> Upload Files
+            <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg text-lg font-semibold transition-colors duration-200 flex items-center justify-center">
+              <i class="fas fa-upload mr-3"></i> Upload Files
             </button>
           </form>
-          
-          <div class="mt-10 pt-6 border-t border-gray-200">
-            <h2 class="text-2xl font-bold mb-4 text-gray-700">Server Status</h2>
+
+          <div class="mt-10 border-t pt-8 border-gray-200">
+            <h2 class="text-2xl font-semibold mb-5 text-gray-700">Server Status</h2>
             <div class="space-y-4">
               <div class="flex items-center p-3 bg-green-50 rounded-lg shadow-sm">
                 <div class="h-4 w-4 bg-green-500 rounded-full mr-3 animate-pulse"></div>
-                <span class="font-semibold text-green-800">Online & Ready</span>
+                <span class="font-medium text-green-800">Online and Operational</span>
               </div>
-              <div class="flex items-center">
-                <i class="fas fa-microchip text-blue-500 text-2xl w-8"></i>
+              <div class="flex items-center text-gray-700">
+                <i class="fas fa-server text-blue-500 text-2xl w-8"></i>
                 <div>
-                  <p class="font-semibold text-gray-700">System Info</p>
-                  <p class="text-sm text-gray-600">Port: <span class="font-mono">${PORT}</span> | Files: <span class="font-mono">${files.length}</span></p>
+                  <p class="font-semibold">System Metrics</p>
+                  <p class="text-sm text-gray-600">Port: ${PORT} | Files: ${Object.keys(fileMetadata).length} | Connections: <span id="active-connections">${activeConnections}</span></p>
                 </div>
               </div>
-              <div class="flex items-center">
-                <i class="fas fa-users text-purple-500 text-2xl w-8"></i>
+              <div class="flex items-center text-gray-700">
+                <i class="fas fa-hdd text-purple-500 text-2xl w-8"></i>
                 <div>
-                  <p class="font-semibold text-gray-700">Active Connections</p>
-                  <p class="text-sm text-gray-600"><span class="font-mono">${connections}</span> (HTTP)</p>
+                  <p class="font-semibold">Storage Usage</p>
+                  <p class="text-sm text-gray-600">${formatBytes(Object.values(fileMetadata).reduce((sum, f) => sum + f.size, 0))} / ${formatBytes(maxFileSize * maxFiles)} (estimated max)</p>
                 </div>
               </div>
-              <div class="flex items-center">
-                <i class="fas fa-history text-indigo-500 text-2xl w-8"></i>
+              <div class="flex items-center text-gray-700">
+                <i class="fas fa-history text-orange-500 text-2xl w-8"></i>
                 <div>
-                  <p class="font-semibold text-gray-700">Activity Log</p>
-                  <p class="text-sm text-gray-600"><span class="font-mono">${fileHistory.length}</span> actions logged</p>
+                  <p class="font-semibold">Activity Log</p>
+                  <p class="text-sm text-gray-600">${fileHistory.length} actions logged</p>
                 </div>
               </div>
-              <a href="/history" class="block mt-6 text-blue-600 hover:text-blue-800 font-medium flex items-center transition-colors duration-200">
-                <i class="fas fa-list-alt mr-2"></i> View full activity history
+              <a href="/history" class="block mt-6 text-blue-600 hover:text-blue-800 flex items-center text-md font-medium transition-colors duration-200">
+                <i class="fas fa-list-alt mr-2"></i> View Full Activity Log
+              </a>
+              <a href="/admin" class="block mt-4 text-purple-600 hover:text-purple-800 flex items-center text-md font-medium transition-colors duration-200">
+                <i class="fas fa-user-cog mr-2"></i> Admin Panel
               </a>
             </div>
           </div>
         </div>
-        
-        <!-- File Manager Panel -->
+
         <div class="md:col-span-3 bg-white rounded-xl shadow-lg p-6">
-          <div class="flex flex-col md:flex-row md:items-center md:justify-between mb-6 border-b pb-4 border-gray-200">
-            <h2 class="text-2xl font-bold text-gray-700 mb-4 md:mb-0">File Manager</h2>
-            <div class="flex flex-wrap items-center space-y-3 md:space-y-0 md:space-x-3">
+          <div class="flex flex-col md:flex-row md:items-center md:justify-between mb-8">
+            <h2 class="text-2xl font-semibold mb-4 md:mb-0 text-gray-700">File Manager</h2>
+            <div class="flex flex-col md:flex-row space-y-3 md:space-y-0 md:space-x-3 w-full md:w-auto">
               <div class="relative w-full md:w-auto">
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   id="search-input"
-                  placeholder="Search files..." 
-                  class="pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 w-full"
+                  placeholder="Search files by name..."
+                  class="pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 w-full"
                 >
-                <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"></i>
+                <i class="fas fa-search absolute left-3 top-3 text-gray-400"></i>
               </div>
-              <select id="file-filter" class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 w-full md:w-auto">
-                <option value="all">All Types</option>
-                <option value="image">Images</option>
-                <option value="pdf">PDFs</option>
-                <option value="document">Documents</option>
-                <option value="spreadsheet">Spreadsheets</option>
-                <option value="presentation">Presentations</option>
-                <option value="text">Text Files</option>
-                <option value="code">Code Files</option>
-                <option value="archive">Archives</option>
-                <option value="audio">Audio</option>
-                <option value="video">Video</option>
-                <option value="other">Other</option>
-              </select>
-              <button 
+              <button
                 id="delete-selected"
-                class="bg-red-600 hover:bg-red-700 text-white font-bold px-4 py-2 rounded-lg flex items-center transition-colors duration-200 shadow-md w-full md:w-auto"
+                class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg flex items-center justify-center transition-colors duration-200"
               >
-                <i class="fas fa-trash-alt mr-2"></i> Delete Selected
+                <i class="fas fa-trash mr-2"></i> Delete Selected
               </button>
             </div>
           </div>
-          
-          <div class="overflow-x-auto min-h-[500px] max-h-[700px] overflow-y-auto rounded-lg border border-gray-200">
+
+          <div class="overflow-x-auto rounded-lg border border-gray-200">
             <table class="min-w-full divide-y divide-gray-200">
-              <thead class="bg-gray-50 sticky top-0 z-10">
+              <thead class="bg-gray-50">
                 <tr>
                   <th class="px-6 py-3 text-left w-10">
                     <input type="checkbox" id="select-all" class="rounded text-blue-600 focus:ring-blue-500">
                   </th>
-                  <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Name</th>
-                  <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Type</th>
-                  <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Size</th>
-                  <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Uploaded</th>
-                  <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Actions</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Size</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Uploaded</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Downloads</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                 </tr>
               </thead>
               <tbody id="file-list" class="bg-white divide-y divide-gray-200">
                 ${files.length > 0 ? files.map(file => `
-                <tr class="hover:bg-gray-50 transition-colors duration-150">
-                  <td class="px-6 py-4">
+                <tr class="hover:bg-gray-50 transition-colors duration-100">
+                  <td class="px-6 py-4 whitespace-nowrap">
                     <input type="checkbox" class="file-checkbox rounded text-blue-600 focus:ring-blue-500" value="${file.id}">
                   </td>
                   <td class="px-6 py-4 whitespace-nowrap">
                     <div class="flex items-center">
-                      <i class="fas ${file.icon} text-blue-500 mr-3 text-lg"></i>
+                      <i class="${file.icon} text-blue-500 mr-3 text-lg"></i>
                       <span class="file-name text-gray-800 font-medium">${file.name}</span>
                     </div>
                   </td>
                   <td class="px-6 py-4 whitespace-nowrap">
-                    <span class="px-2 py-1 text-xs font-semibold rounded-full bg-blue-100 text-blue-800 file-type-badge" data-filetype="${file.type}">
-                      ${file.type.charAt(0).toUpperCase() + file.type.slice(1).replace('_', ' ')}
+                    <span class="px-2 py-1 text-xs font-semibold rounded-full bg-gray-100 text-gray-800">
+                      ${file.type.charAt(0).toUpperCase() + file.type.slice(1)}
                     </span>
                   </td>
-                  <td class="px-6 py-4 whitespace-nowrap text-gray-600">${file.size}</td>
-                  <td class="px-6 py-4 whitespace-nowrap text-gray-600 text-sm">${file.uploaded}</td>
+                  <td class="px-6 py-4 whitespace-nowrap text-gray-700">${file.size}</td>
+                  <td class="px-6 py-4 whitespace-nowrap text-gray-700" title="Last Modified: ${file.lastModified}">${file.uploaded}</td>
+                  <td class="px-6 py-4 whitespace-nowrap text-gray-700">${file.downloads}</td>
                   <td class="px-6 py-4 whitespace-nowrap">
-                    <div class="flex space-x-3">
-                      <a href="${file.previewUrl}" class="text-blue-600 hover:text-blue-800 text-lg transition-colors duration-200" title="Preview">
-                        <i class="fas fa-eye"></i>
+                    <div class="flex space-x-4">
+                      <a href="${file.previewUrl}" class="text-blue-600 hover:text-blue-800 transition-colors duration-200" title="Preview">
+                        <i class="fas fa-eye text-lg"></i>
                       </a>
-                      <a href="${file.downloadUrl}" class="text-green-600 hover:text-green-800 text-lg transition-colors duration-200" title="Download">
-                        <i class="fas fa-download"></i>
+                      <a href="${file.downloadUrl}" class="text-green-600 hover:text-green-800 transition-colors duration-200" title="Download">
+                        <i class="fas fa-download text-lg"></i>
                       </a>
                       ${file.editUrl ? `
-                      <a href="${file.editUrl}" class="text-yellow-600 hover:text-yellow-800 text-lg transition-colors duration-200" title="Edit">
-                        <i class="fas fa-edit"></i>
+                      <a href="${file.editUrl}" class="text-yellow-600 hover:text-yellow-800 transition-colors duration-200" title="Edit">
+                        <i class="fas fa-edit text-lg"></i>
                       </a>
                       ` : `
-                      <span class="text-gray-400 text-lg cursor-not-allowed" title="Not editable">
-                        <i class="fas fa-edit"></i>
+                      <span class="text-gray-400 cursor-not-allowed" title="Editing not available for this file type">
+                        <i class="fas fa-edit text-lg"></i>
                       </span>
                       `}
-                      <button onclick="if(confirm('Are you sure you want to delete this file? This action cannot be undone.')) { fetch('/delete/${file.id}', { method: 'POST' }).then(() => window.location.reload()); }" 
-                        class="text-red-600 hover:text-red-800 text-lg transition-colors duration-200" title="Delete">
-                        <i class="fas fa-trash"></i>
+                      <a href="/share/${file.id}" class="text-purple-600 hover:text-purple-800 transition-colors duration-200" title="Share">
+                        <i class="fas fa-share-alt text-lg"></i>
+                      </a>
+                      <button onclick="if(confirm('Are you absolutely sure you want to delete \'${file.name}\'? This cannot be undone.')) window.location.href='/delete/${file.id}'"
+                        class="text-red-600 hover:text-red-800 transition-colors duration-200" title="Delete">
+                        <i class="fas fa-trash text-lg"></i>
                       </button>
                     </div>
                   </td>
                 </tr>
                 `).join('') : `
                 <tr>
-                  <td colspan="6" class="px-6 py-16 text-center text-gray-500">
+                  <td colspan="7" class="px-6 py-16 text-center text-gray-500">
                     <i class="fas fa-inbox text-5xl text-gray-300 mb-4"></i>
-                    <p class="text-lg font-medium">No files uploaded yet.</p>
-                    <p class="mt-2 text-sm">Use the upload panel on the left to get started!</p>
+                    <p class="text-lg">No files uploaded yet. Start by uploading some files!</p>
                   </td>
                 </tr>
                 `}
@@ -767,6 +781,15 @@ function renderDashboard(files, connections) {
         </div>
       </div>
     </div>
+    <script>
+      // Update active connections dynamically (simple polling example)
+      // In a real-time system, consider WebSockets
+      // setInterval(async () => {
+      //   const response = await fetch('/api/status'); // A new endpoint to provide server status
+      //   const data = await response.json();
+      //   document.getElementById('active-connections').textContent = data.activeConnections;
+      // }, 5000); // Every 5 seconds
+    </script>
   </body>
   </html>
   `;
@@ -779,31 +802,29 @@ function renderImagePreview(filename, originalName) {
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Preview: ${originalName}</title>
+    <title>Image Preview: ${originalName}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal flex flex-col min-h-screen">
-    <div class="bg-white shadow-md p-4">
-      <div class="container mx-auto flex justify-between items-center">
-        <h1 class="text-2xl font-bold text-gray-800">
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
           <i class="fas fa-image text-blue-500 mr-2"></i>
           ${originalName}
         </h1>
-        <div class="flex space-x-4">
-          <a href="/download/${filename}" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center transition-colors duration-200 shadow">
-            <i class="fas fa-download mr-2"></i> Download
+        <div class="flex space-x-3">
+          <a href="/download/${filename}" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-download mr-1"></i> Download
           </a>
-          <a href="/" class="text-gray-600 hover:text-gray-800 text-3xl transition-colors duration-200" title="Close Preview">
-            <i class="fas fa-times"></i>
+          <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-arrow-left mr-1"></i> Back
           </a>
         </div>
       </div>
-    </div>
-    
-    <div class="flex-grow flex items-center justify-center p-8">
-      <div class="bg-white rounded-lg shadow-xl p-6 max-w-full max-h-full flex justify-center items-center overflow-hidden">
-        <img src="/download/${filename}" alt="${originalName}" class="max-w-full max-h-[80vh] object-contain rounded-lg">
+
+      <div class="bg-white rounded-xl shadow-lg p-6 flex justify-center items-center overflow-hidden" style="min-height: 70vh;">
+        <img src="/download/${filename}" alt="${originalName}" class="max-w-full max-h-full object-contain border border-gray-200 rounded-lg">
       </div>
     </div>
   </body>
@@ -818,32 +839,30 @@ function renderPDFPreview(filename, originalName) {
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF: ${originalName}</title>
+    <title>PDF Preview: ${originalName}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal flex flex-col min-h-screen">
-    <div class="bg-white shadow-md p-4">
-      <div class="container mx-auto flex justify-between items-center">
-        <h1 class="text-2xl font-bold text-gray-800">
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
           <i class="fas fa-file-pdf text-red-500 mr-2"></i>
           ${originalName}
         </h1>
-        <div class="flex space-x-4">
-          <a href="/download/${filename}" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center transition-colors duration-200 shadow">
-            <i class="fas fa-download mr-2"></i> Download
+        <div class="flex space-x-3">
+          <a href="/download/${filename}" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-download mr-1"></i> Download
           </a>
-          <a href="/" class="text-gray-600 hover:text-gray-800 text-3xl transition-colors duration-200" title="Close Preview">
-            <i class="fas fa-times"></i>
+          <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-arrow-left mr-1"></i> Back
           </a>
         </div>
       </div>
-    </div>
-    
-    <div class="flex-grow flex items-center justify-center p-4">
-      <div class="bg-white rounded-lg shadow-xl overflow-hidden w-full h-[90vh]">
-        <iframe 
-          src="/download/${filename}" 
+
+      <div class="bg-white rounded-xl shadow-lg overflow-hidden" style="min-height: 80vh;">
+        <iframe
+          src="/download/${filename}"
           class="w-full h-full border-none"
           title="PDF Viewer for ${originalName}"
         ></iframe>
@@ -861,38 +880,50 @@ function renderTextViewer(filename, originalName, content) {
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>View: ${originalName}</title>
+    <title>Text Viewer: ${originalName}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+      pre {
+        white-space: pre-wrap; /* Ensures long lines wrap */
+        word-wrap: break-word; /* Breaks long words */
+      }
+      /* Custom scrollbar for text viewer */
+      pre::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      pre::-webkit-scrollbar-thumb {
+        background-color: #cbd5e0; /* gray-400 */
+        border-radius: 4px;
+      }
+      pre::-webkit-scrollbar-track {
+        background-color: #f7fafc; /* gray-50 */
+      }
+    </style>
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal flex flex-col min-h-screen">
-    <div class="bg-white shadow-md p-4">
-      <div class="container mx-auto flex justify-between items-center">
-        <h1 class="text-2xl font-bold text-gray-800">
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
           <i class="fas fa-file-alt text-blue-500 mr-2"></i>
           ${originalName}
         </h1>
-        <div class="flex space-x-4">
-          <a href="/download/${filename}" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center transition-colors duration-200 shadow">
-            <i class="fas fa-download mr-2"></i> Download
+        <div class="flex space-x-3">
+          <a href="/download/${filename}" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-download mr-1"></i> Download
           </a>
-          <a href="/edit/${filename}" class="bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-2 px-4 rounded-lg flex items-center transition-colors duration-200 shadow">
-            <i class="fas fa-edit mr-2"></i> Edit
+          <a href="/edit/${filename}" class="bg-yellow-500 hover:bg-yellow-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-edit mr-1"></i> Edit
           </a>
-          <a href="/" class="text-gray-600 hover:text-gray-800 text-3xl transition-colors duration-200" title="Close Viewer">
-            <i class="fas fa-times"></i>
+          <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-arrow-left mr-1"></i> Back
           </a>
         </div>
       </div>
-    </div>
-    
-    <div class="flex-grow flex items-center justify-center p-4">
-      <div class="bg-gray-800 rounded-lg shadow-xl overflow-hidden w-full h-[90vh] flex flex-col">
-        <div class="p-4 bg-gray-900 text-gray-300 border-b border-gray-700 flex items-center justify-between">
-          <span class="font-mono text-sm">${originalName}</span>
-          <span class="text-xs text-gray-500">${getFileType(filename).toUpperCase()} file</span>
-        </div>
-        <pre class="flex-grow p-6 font-mono text-sm text-gray-200 overflow-auto whitespace-pre-wrap"><code class="language-${getFileType(filename) === 'code' ? 'javascript' : 'text'}">${escapeHtml(content)}</code></pre>
+
+      <div class="bg-white rounded-xl shadow-lg overflow-hidden">
+        <pre class="p-6 font-mono text-sm leading-relaxed text-gray-800 bg-gray-50 border border-gray-200 rounded-lg overflow-auto" style="max-height: 80vh;">${escapeHtml(content)}</pre>
       </div>
     </div>
   </body>
@@ -900,47 +931,41 @@ function renderTextViewer(filename, originalName, content) {
   `;
 }
 
-function renderMediaPlayer(filename, originalName, mediaType) {
-  const mediaTag = mediaType === 'audio' ? 'audio' : 'video';
-  const icon = mediaType === 'audio' ? 'fa-file-audio' : 'fa-file-video';
-  const color = mediaType === 'audio' ? 'text-purple-500' : 'text-teal-500';
-
+function renderAudioPlayer(filename, originalName) {
   return `
   <!DOCTYPE html>
   <html lang="en">
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${mediaType.charAt(0).toUpperCase() + mediaType.slice(1)}: ${originalName}</title>
+    <title>Audio Player: ${originalName}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal flex flex-col min-h-screen">
-    <div class="bg-white shadow-md p-4">
-      <div class="container mx-auto flex justify-between items-center">
-        <h1 class="text-2xl font-bold text-gray-800">
-          <i class="fas ${icon} ${color} mr-2"></i>
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
+          <i class="fas fa-file-audio text-green-500 mr-2"></i>
           ${originalName}
         </h1>
-        <div class="flex space-x-4">
-          <a href="/download/${filename}" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center transition-colors duration-200 shadow">
-            <i class="fas fa-download mr-2"></i> Download
+        <div class="flex space-x-3">
+          <a href="/download/${filename}" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-download mr-1"></i> Download
           </a>
-          <a href="/" class="text-gray-600 hover:text-gray-800 text-3xl transition-colors duration-200" title="Close Viewer">
-            <i class="fas fa-times"></i>
+          <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-arrow-left mr-1"></i> Back
           </a>
         </div>
       </div>
-    </div>
-    
-    <div class="flex-grow flex items-center justify-center p-4">
-      <div class="bg-white rounded-lg shadow-xl overflow-hidden p-6 w-full max-w-4xl text-center">
-        <h2 class="text-xl font-semibold mb-4 text-gray-700">Playing: ${originalName}</h2>
-        <${mediaTag} controls class="w-full h-auto ${mediaTag === 'video' ? 'max-h-[70vh]' : ''} bg-black rounded-lg">
-          <source src="/download/${filename}" type="${mediaType}/${path.extname(filename).slice(1)}">
-          Your browser does not support the ${mediaTag} tag.
-        </${mediaTag}>
-        <p class="mt-4 text-sm text-gray-500">File size: ${formatBytes(fs.statSync(path.join(uploadDir, filename)).size)}</p>
+
+      <div class="bg-white rounded-xl shadow-lg p-8 flex flex-col items-center justify-center">
+        <i class="fas fa-music text-6xl text-gray-400 mb-6"></i>
+        <p class="text-xl font-medium text-gray-700 mb-4">${originalName}</p>
+        <audio controls class="w-full max-w-lg">
+          <source src="/download/${filename}" type="audio/${path.extname(filename).slice(1)}">
+          Your browser does not support the audio element.
+        </audio>
       </div>
     </div>
   </body>
@@ -948,53 +973,40 @@ function renderMediaPlayer(filename, originalName, mediaType) {
   `;
 }
 
-function renderFileEditor(filename, content) {
+function renderVideoPlayer(filename, originalName) {
   return `
   <!DOCTYPE html>
   <html lang="en">
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edit File: ${filename.split('-').slice(2).join('-')}</title>
+    <title>Video Player: ${originalName}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal flex flex-col min-h-screen">
-    <div class="bg-white shadow-md p-4">
-      <div class="container mx-auto flex justify-between items-center">
-        <h1 class="text-2xl font-bold text-gray-800">
-          <i class="fas fa-edit text-yellow-500 mr-2"></i>
-          Editing: ${filename.split('-').slice(2).join('-')}
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
+          <i class="fas fa-file-video text-purple-500 mr-2"></i>
+          ${originalName}
         </h1>
-        <div class="flex space-x-4">
-          <a href="/preview/${filename}" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center transition-colors duration-200 shadow">
-            <i class="fas fa-eye mr-2"></i> Preview
+        <div class="flex space-x-3">
+          <a href="/download/${filename}" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-download mr-1"></i> Download
           </a>
-          <a href="/" class="text-gray-600 hover:text-gray-800 text-3xl transition-colors duration-200" title="Close Editor">
-            <i class="fas fa-times"></i>
+          <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-arrow-left mr-1"></i> Back
           </a>
         </div>
       </div>
-    </div>
-    
-    <div class="flex-grow flex items-center justify-center p-4">
-      <div class="bg-white rounded-lg shadow-xl p-6 w-full max-w-4xl">
-        <form action="/save/${filename}" method="POST" class="flex flex-col h-[70vh]">
-          <textarea 
-            name="content" 
-            rows="20" 
-            class="flex-grow w-full p-4 font-mono text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-gray-800 text-gray-200 outline-none resize-none"
-            spellcheck="false"
-          >${escapeHtml(content)}</textarea>
-          <div class="mt-6 flex justify-end space-x-3">
-            <a href="/preview/${filename}" class="bg-gray-500 hover:bg-gray-600 text-white font-bold px-5 py-2 rounded-lg transition-colors duration-200 shadow">
-              Cancel
-            </a>
-            <button type="submit" class="bg-green-600 hover:bg-green-700 text-white font-bold px-5 py-2 rounded-lg transition-colors duration-200 shadow">
-              <i class="fas fa-save mr-2"></i> Save Changes
-            </button>
-          </div>
-        </form>
+
+      <div class="bg-white rounded-xl shadow-lg p-6 flex flex-col items-center justify-center">
+        <p class="text-xl font-medium text-gray-700 mb-4">${originalName}</p>
+        <video controls class="w-full max-w-3xl border border-gray-200 rounded-lg">
+          <source src="/download/${filename}" type="video/${path.extname(filename).slice(1)}">
+          Your browser does not support the video element.
+        </video>
       </div>
     </div>
   </body>
@@ -1002,10 +1014,71 @@ function renderFileEditor(filename, content) {
   `;
 }
 
-function renderDefaultPreview(filename, originalName, size) {
-  const fileType = getFileType(filename);
-  const icon = getFileIcon(fileType);
+function renderFileEditor(filename, originalName, content) {
+  return `
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edit File: ${originalName}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+      /* Custom scrollbar for textarea */
+      textarea::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      textarea::-webkit-scrollbar-thumb {
+        background-color: #cbd5e0; /* gray-400 */
+        border-radius: 4px;
+      }
+      textarea::-webkit-scrollbar-track {
+        background-color: #f7fafc; /* gray-50 */
+      }
+    </style>
+  </head>
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
+          <i class="fas fa-edit text-yellow-500 mr-2"></i>
+          Editing: ${originalName}
+        </h1>
+        <div class="flex space-x-3">
+          <a href="/preview/${filename}" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-eye mr-1"></i> Preview
+          </a>
+          <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-arrow-left mr-1"></i> Back to Dashboard
+          </a>
+        </div>
+      </div>
 
+      <form action="/save/${filename}" method="POST" class="bg-white rounded-xl shadow-lg p-6">
+        <textarea
+          name="content"
+          rows="25"
+          class="w-full p-4 font-mono text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-gray-50 text-gray-800"
+          spellcheck="false"
+        >${escapeHtml(content)}</textarea>
+        <div class="mt-6 flex justify-end space-x-3">
+          <a href="/preview/${filename}" class="bg-gray-500 hover:bg-gray-600 text-white px-5 py-2 rounded-lg font-semibold transition-colors duration-200">
+            Cancel
+          </a>
+          <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded-lg font-semibold transition-colors duration-200">
+            <i class="fas fa-save mr-2"></i> Save Changes
+          </button>
+        </div>
+      </form>
+    </div>
+  </body>
+  </html>
+  `;
+}
+
+function renderDefaultPreview(filename, originalName, size, fileType) {
   return `
   <!DOCTYPE html>
   <html lang="en">
@@ -1014,38 +1087,88 @@ function renderDefaultPreview(filename, originalName, size) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>File Info: ${originalName}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal flex flex-col min-h-screen">
-    <div class="bg-white shadow-md p-4">
-      <div class="container mx-auto flex justify-between items-center">
-        <h1 class="text-2xl font-bold text-gray-800">
-          <i class="fas ${icon} text-blue-500 mr-2"></i>
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
+          <i class="${getFileIcon(fileType)} text-blue-500 mr-2"></i>
           ${originalName}
         </h1>
-        <div class="flex space-x-4">
-          <a href="/download/${filename}" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center transition-colors duration-200 shadow">
-            <i class="fas fa-download mr-2"></i> Download
+        <div class="flex space-x-3">
+          <a href="/download/${filename}" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-download mr-1"></i> Download
           </a>
-          <a href="/" class="text-gray-600 hover:text-gray-800 text-3xl transition-colors duration-200" title="Close Info">
-            <i class="fas fa-times"></i>
+          <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+            <i class="fas fa-arrow-left mr-1"></i> Back
           </a>
         </div>
       </div>
-    </div>
-    
-    <div class="flex-grow flex items-center justify-center p-8">
-      <div class="bg-white rounded-lg shadow-xl p-8 text-center max-w-lg w-full">
-        <i class="fas ${icon} text-8xl text-gray-400 mb-6"></i>
-        <h2 class="text-3xl font-bold text-gray-800 mb-3">${originalName}</h2>
-        <p class="text-lg text-gray-600 mb-2">Type: <span class="font-semibold">${fileType.charAt(0).toUpperCase() + fileType.slice(1).replace('_', ' ')}</span></p>
-        <p class="text-lg text-gray-600 mb-6">Size: <span class="font-semibold">${formatBytes(size)}</span></p>
-        <p class="text-gray-500 text-base">
-          Preview is not available for this file type in the browser. <br>
-          Please download the file to open it with a suitable application.
+
+      <div class="bg-white rounded-xl shadow-lg p-8 text-center">
+        <i class="${getFileIcon(fileType)} text-7xl text-gray-400 mb-6"></i>
+        <h2 class="text-2xl font-medium text-gray-800 mb-3">${originalName}</h2>
+        <p class="text-gray-600 mb-6">${formatBytes(size)} • ${path.extname(filename).toUpperCase().slice(1) || 'Unknown Type'}</p>
+        <p class="text-gray-500 text-lg">
+          Preview is not available for this file type. You can download it to view.
         </p>
       </div>
     </div>
+  </body>
+  </html>
+  `;
+}
+
+function renderShareLink(filename, originalName) {
+  const shareableLink = `${req.protocol}://${req.get('host')}/download/${filename}`; // Or a dedicated /s/:token route
+
+  return `
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Share File: ${originalName}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  </head>
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-gray-800">
+          <i class="fas fa-share-alt text-purple-500 mr-2"></i>
+          Share: ${originalName}
+        </h1>
+        <a href="/" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+          <i class="fas fa-arrow-left mr-1"></i> Back
+        </a>
+      </div>
+
+      <div class="bg-white rounded-xl shadow-lg p-8 text-center">
+        <p class="text-gray-700 text-lg mb-4">
+          Share this link to allow others to download <strong>${originalName}</strong>:
+        </p>
+        <div class="flex items-center justify-center space-x-3 mb-6">
+          <input type="text" id="shareLink" value="${shareableLink}" readonly
+                 class="w-full max-w-xl p-3 border border-gray-300 rounded-lg bg-gray-50 font-mono text-blue-700">
+          <button onclick="copyShareLink()" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-3 rounded-lg font-semibold transition-colors duration-200">
+            <i class="fas fa-copy mr-2"></i> Copy
+          </button>
+        </div>
+        <p class="text-sm text-gray-500">
+          Note: This link provides direct download access. For more secure sharing, consider implementing expiring links or password protection.
+        </p>
+      </div>
+    </div>
+    <script>
+      function copyShareLink() {
+        const shareLinkInput = document.getElementById('shareLink');
+        shareLinkInput.select();
+        document.execCommand('copy');
+        alert('Share link copied to clipboard!');
+      }
+    </script>
   </body>
   </html>
   `;
@@ -1060,88 +1183,200 @@ function renderHistory(history) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Activity History</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
-    <style>
-      ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-      }
-      ::-webkit-scrollbar-track {
-        background: #f1f1f1;
-        border-radius: 10px;
-      }
-      ::-webkit-scrollbar-thumb {
-        background: #888;
-        border-radius: 10px;
-      }
-      ::-webkit-scrollbar-thumb:hover {
-        background: #555;
-      }
-    </style>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal">
-    <div class="container mx-auto px-4 py-8">
-      <div class="flex justify-between items-center mb-8 border-b pb-4 border-gray-200">
+  <body class="bg-gray-100 flex flex-col min-h-screen">
+    <div class="container mx-auto px-4 py-8 flex-grow">
+      <div class="flex justify-between items-center mb-6">
         <h1 class="text-3xl font-bold text-gray-800">
           <i class="fas fa-history text-purple-500 mr-2"></i>
           Activity History
         </h1>
-        <a href="/" class="text-blue-600 hover:text-blue-800 font-medium flex items-center transition-colors duration-200">
-          <i class="fas fa-arrow-left mr-2"></i> Back to File Manager
+        <a href="/" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+          <i class="fas fa-arrow-left mr-1"></i> Back to Dashboard
         </a>
       </div>
-      
-      <div class="bg-white rounded-xl shadow-lg overflow-hidden border border-gray-200">
-        <div class="overflow-x-auto max-h-[80vh] overflow-y-auto">
-          <table class="min-w-full divide-y divide-gray-200">
-            <thead class="bg-gray-50 sticky top-0 z-10">
-              <tr>
-                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Action</th>
-                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">File</th>
-                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Time</th>
-                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">IP Address</th>
-              </tr>
-            </thead>
-            <tbody class="bg-white divide-y divide-gray-200">
-              ${history.length > 0 ? history.map(entry => `
-              <tr class="hover:bg-gray-50 transition-colors duration-150">
-                <td class="px-6 py-4 whitespace-nowrap">
-                  <span class="px-3 py-1 inline-flex items-center text-xs font-bold rounded-full 
-                    ${entry.action === 'upload' ? 'bg-green-100 text-green-800' : ''}
-                    ${entry.action === 'download' ? 'bg-blue-100 text-blue-800' : ''}
-                    ${entry.action === 'edit' ? 'bg-yellow-100 text-yellow-800' : ''}
-                    ${entry.action === 'delete' ? 'bg-red-100 text-red-800' : ''}
-                  ">
-                    <i class="fas 
-                      ${entry.action === 'upload' ? 'fa-upload' : ''}
-                      ${entry.action === 'download' ? 'fa-download' : ''}
-                      ${entry.action === 'edit' ? 'fa-edit' : ''}
-                      ${entry.action === 'delete' ? 'fa-trash-alt' : ''}
-                      mr-1"></i>
-                    ${entry.action.charAt(0).toUpperCase() + entry.action.slice(1)}
-                  </span>
-                </td>
-                <td class="px-6 py-4 whitespace-nowrap text-gray-700 font-medium">${escapeHtml(entry.filename)}</td>
-                <td class="px-6 py-4 whitespace-nowrap text-gray-600 text-sm">${new Date(entry.timestamp).toLocaleString()}</td>
-                <td class="px-6 py-4 whitespace-nowrap text-gray-600 text-sm font-mono">${escapeHtml(entry.ip)}</td>
-              </tr>
-              `).join('') : `
-              <tr>
-                <td colspan="4" class="px-6 py-16 text-center text-gray-500">
-                  <i class="fas fa-clipboard-list text-5xl text-gray-300 mb-4"></i>
-                  <p class="text-lg font-medium">No activity recorded yet.</p>
-                  <p class="mt-2 text-sm">Perform some file operations to see the history here!</p>
-                </td>
-              </tr>
-              `}
-            </tbody>
-          </table>
-        </div>
+
+      <div class="bg-white rounded-xl shadow-lg overflow-hidden">
+        <table class="min-w-full divide-y divide-gray-200">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">File</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">IP Address</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User Agent</th>
+            </tr>
+          </thead>
+          <tbody class="bg-white divide-y divide-gray-200">
+            ${history.length > 0 ? history.map(entry => `
+            <tr class="hover:bg-gray-50 transition-colors duration-100">
+              <td class="px-6 py-4 whitespace-nowrap">
+                <span class="px-3 py-1 inline-flex items-center text-xs font-semibold rounded-full ${
+                  entry.action === 'upload' ? 'bg-green-100 text-green-800' :
+                  entry.action === 'download' ? 'bg-blue-100 text-blue-800' :
+                  entry.action === 'edit' ? 'bg-yellow-100 text-yellow-800' :
+                  entry.action === 'delete' ? 'bg-red-100 text-red-800' :
+                  'bg-gray-100 text-gray-800'
+                }">
+                  <i class="fas ${
+                    entry.action === 'upload' ? 'fa-upload' :
+                    entry.action === 'download' ? 'fa-download' :
+                    entry.action === 'edit' ? 'fa-edit' :
+                    entry.action === 'delete' ? 'fa-trash' :
+                    'fa-info-circle'
+                  } mr-1"></i>
+                  ${entry.action.charAt(0).toUpperCase() + entry.action.slice(1)}
+                </span>
+              </td>
+              <td class="px-6 py-4 text-gray-800">${escapeHtml(entry.filename)}</td>
+              <td class="px-6 py-4 text-gray-700">${new Date(entry.timestamp).toLocaleString()}</td>
+              <td class="px-6 py-4 text-gray-700">${escapeHtml(entry.ip)}</td>
+              <td class="px-6 py-4 text-gray-700 text-sm">${escapeHtml(entry.userAgent)}</td>
+            </tr>
+            `).join('') : `
+            <tr>
+              <td colspan="5" class="px-6 py-12 text-center text-gray-500">
+                <i class="fas fa-clipboard-list text-5xl text-gray-300 mb-4"></i>
+                <p class="text-lg">No activity recorded yet.</p>
+              </td>
+            </tr>
+            `}
+          </tbody>
+        </table>
       </div>
     </div>
   </body>
   </html>
   `;
+}
+
+function renderAdminPanel(systemInfo, fileMetadata, fileHistory) {
+    const files = Object.values(fileMetadata);
+    const recentHistory = fileHistory.slice(0, 10); // Show top 10 recent activities
+    const popularFiles = files.sort((a, b) => b.downloads - a.downloads).slice(0, 5);
+    const fileTypes = files.reduce((acc, file) => {
+        acc[file.type] = (acc[file.type] || 0) + 1;
+        return acc;
+    }, {});
+    const fileTypeBreakdown = Object.entries(fileTypes).map(([type, count]) => `
+        <li class="flex justify-between items-center text-gray-700">
+            <span><i class="${getFileIcon(type)} mr-2 text-blue-500"></i> ${type.charAt(0).toUpperCase() + type.slice(1)}</span>
+            <span class="px-2 py-1 bg-blue-100 text-blue-800 rounded-full text-xs font-semibold">${count}</span>
+        </li>
+    `).join('');
+
+    return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Admin Panel</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    </head>
+    <body class="bg-gray-100 flex flex-col min-h-screen">
+        <div class="container mx-auto px-4 py-8 flex-grow">
+            <div class="flex justify-between items-center mb-6">
+                <h1 class="text-3xl font-bold text-gray-800">
+                    <i class="fas fa-user-cog text-indigo-500 mr-2"></i>
+                    Admin Panel
+                </h1>
+                <a href="/" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center transition-colors duration-200">
+                    <i class="fas fa-arrow-left mr-1"></i> Back to Dashboard
+                </a>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
+                <div class="bg-white rounded-xl shadow-lg p-6">
+                    <h2 class="text-xl font-semibold mb-4 text-gray-700 flex items-center">
+                        <i class="fas fa-info-circle mr-2 text-indigo-500"></i> System Overview
+                    </h2>
+                    <ul class="space-y-3 text-gray-700">
+                        <li class="flex justify-between"><span>Total Files:</span> <span class="font-medium">${systemInfo.totalFiles}</span></li>
+                        <li class="flex justify-between"><span>Total Storage Used:</span> <span class="font-medium">${systemInfo.totalStorageUsed}</span></li>
+                        <li class="flex justify-between"><span>Active Connections:</span> <span class="font-medium">${systemInfo.activeConnections}</span></li>
+                        <li class="flex justify-between"><span>Max File Size:</span> <span class="font-medium">${systemInfo.maxFileSize}</span></li>
+                        <li class="flex justify-between"><span>Max Files per Upload:</span> <span class="font-medium">${systemInfo.maxFilesPerUpload}</span></li>
+                        <li class="flex justify-between"><span>File Retention Policy:</span> <span class="font-medium">${systemInfo.retentionPolicy}</span></li>
+                    </ul>
+                </div>
+
+                <div class="bg-white rounded-xl shadow-lg p-6">
+                    <h2 class="text-xl font-semibold mb-4 text-gray-700 flex items-center">
+                        <i class="fas fa-chart-pie mr-2 text-green-500"></i> File Type Breakdown
+                    </h2>
+                    <ul class="space-y-3">
+                        ${fileTypeBreakdown.length > 0 ? fileTypeBreakdown : '<li class="text-gray-500">No files to categorize.</li>'}
+                    </ul>
+                </div>
+
+                <div class="bg-white rounded-xl shadow-lg p-6">
+                    <h2 class="text-xl font-semibold mb-4 text-gray-700 flex items-center">
+                        <i class="fas fa-trophy mr-2 text-yellow-500"></i> Most Downloaded Files
+                    </h2>
+                    <ul class="space-y-3">
+                        ${popularFiles.length > 0 ? popularFiles.map(file => `
+                            <li class="flex justify-between items-center text-gray-700">
+                                <span class="truncate">${escapeHtml(file.name)}</span>
+                                <span class="px-2 py-1 bg-yellow-100 text-yellow-800 rounded-full text-xs font-semibold">${file.downloads} downloads</span>
+                            </li>
+                        `).join('') : '<li class="text-gray-500">No downloads recorded.</li>'}
+                    </ul>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-xl shadow-lg p-6">
+                <h2 class="text-xl font-semibold mb-4 text-gray-700 flex items-center">
+                    <i class="fas fa-clock-rotate-left mr-2 text-blue-500"></i> Recent Activity (Last 10)
+                </h2>
+                <div class="overflow-x-auto rounded-lg border border-gray-200">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">File</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">IP</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            ${recentHistory.length > 0 ? recentHistory.map(entry => `
+                                <tr class="hover:bg-gray-50">
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <span class="px-3 py-1 inline-flex items-center text-xs font-semibold rounded-full ${
+                                            entry.action === 'upload' ? 'bg-green-100 text-green-800' :
+                                            entry.action === 'download' ? 'bg-blue-100 text-blue-800' :
+                                            entry.action === 'edit' ? 'bg-yellow-100 text-yellow-800' :
+                                            'bg-red-100 text-red-800'
+                                        }">
+                                            <i class="fas ${
+                                                entry.action === 'upload' ? 'fa-upload' :
+                                                entry.action === 'download' ? 'fa-download' :
+                                                entry.action === 'edit' ? 'fa-edit' :
+                                                'fa-trash'
+                                            } mr-1"></i>
+                                            ${entry.action.charAt(0).toUpperCase() + entry.action.slice(1)}
+                                        </span>
+                                    </td>
+                                    <td class="px-6 py-4 text-gray-800 truncate" style="max-width: 200px;">${escapeHtml(entry.filename)}</td>
+                                    <td class="px-6 py-4 text-gray-700">${new Date(entry.timestamp).toLocaleString()}</td>
+                                    <td class="px-6 py-4 text-gray-700">${escapeHtml(entry.ip)}</td>
+                                </tr>
+                            `).join('') : `
+                                <tr>
+                                    <td colspan="4" class="px-6 py-12 text-center text-gray-500">No recent activity.</td>
+                                </tr>
+                            `}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    `;
 }
 
 function renderError(message) {
@@ -1153,23 +1388,21 @@ function renderError(message) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Error</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-..." crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   </head>
-  <body class="bg-gray-100 font-sans leading-normal tracking-normal flex items-center justify-center min-h-screen">
+  <body class="bg-gray-100 flex items-center justify-center min-h-screen">
     <div class="container mx-auto px-4 py-8">
-      <div class="bg-red-50 border-l-4 border-red-500 p-6 rounded-lg shadow-lg max-w-2xl mx-auto">
+      <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-8 rounded-lg shadow-md max-w-lg mx-auto" role="alert">
         <div class="flex items-center">
           <div class="flex-shrink-0">
-            <i class="fas fa-exclamation-circle text-red-500 text-4xl"></i>
+            <i class="fas fa-exclamation-triangle text-red-500 text-3xl"></i>
           </div>
           <div class="ml-4">
-            <h3 class="text-2xl font-bold text-red-800 mb-2">Oops! An Error Occurred.</h3>
-            <div class="text-red-700 text-lg">
-              <p>${escapeHtml(message)}</p>
-            </div>
+            <h3 class="text-xl font-bold mb-2">Operation Failed!</h3>
+            <p class="text-lg">${escapeHtml(message)}</p>
             <div class="mt-6">
-              <a href="/" class="inline-flex items-center px-5 py-3 border border-transparent text-base font-medium rounded-md text-red-700 bg-red-100 hover:bg-red-200 transition-colors duration-200 shadow-sm">
-                <i class="fas fa-arrow-left mr-3"></i> Return to Dashboard
+              <a href="/" class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-red-700 bg-red-200 hover:bg-red-300 transition-colors duration-200">
+                <i class="fas fa-arrow-left mr-2"></i> Return to Dashboard
               </a>
             </div>
           </div>
@@ -1181,42 +1414,45 @@ function renderError(message) {
   `;
 }
 
-/**
- * Escapes HTML entities in a string to prevent XSS.
- * @param {string} text - The string to escape.
- * @returns {string} The escaped string.
- */
-/**
- * Escapes HTML entities in a string to prevent XSS.
- * @param {string} text - The string to escape.
- * @returns {string} The escaped string.
- */
-/**
- * Escapes HTML entities in a string to prevent XSS.
- * @param {string} text - The string to escape.
- * @returns {string} The escaped string.
- */
+// Helper to escape HTML to prevent XSS in displayed content
 function escapeHtml(text) {
   const map = {
-    '&': '&',
-    '<': '<',
-    '>': '>',
-    '"': '"',
-    "'": ''' // यह बिल्कुल ऐसे ही होना चाहिए, बिना किसी अतिरिक्त ''' या कमेंट के।
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;'
   };
   return text.replace(/[&<>"']/g, function(m) { return map[m]; });
 }
+
+
 // Start server
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`
-  ===========================================
-  ⚡️ Advanced File Server is now Running! ⚡️
-  ===========================================
-  🚀 Access it at: http://localhost:${PORT}
-  -------------------------------------------
-  📁 File storage directory: ${path.resolve(uploadDir)}
-  📦 Max upload file size: ${formatBytes(maxFileSize)}
-  📄 Max files per upload: ${maxFiles}
-  📜 Activity history limit: ${historyLimit} entries
+  ⚡️ Advanced File Server
+  ========================
+  🚀 Server running on port ${PORT}
+  🔗 Access at: http://localhost:${PORT}/
+  📁 File storage: ${path.join(__dirname, uploadDir)}
   `);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server');
+    server.close(() => {
+        console.log('HTTP server closed.');
+        // Optionally, save in-memory data to a persistent store here
+        process.exit(0);
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT signal received: closing HTTP server');
+    server.close(() => {
+        console.log('HTTP server closed.');
+        // Optionally, save in-memory data to a persistent store here
+        process.exit(0);
+    });
 });
